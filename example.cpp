@@ -33,15 +33,25 @@ void create_package(const char *name) {
 	
 	// build to file
 	{
-		package.build_package_to_file(name); 
+		if (package.build_package_to_file(name)) {
+	    	// success
+		}
+		else {
+			// handle error
+		}
 	}
 
 	// build to memory
 	{
 		uint64_t bfcap = package.calculate_size_needed_for_package();
 		void *package_in_memory = malloc(bfcap);
-		package.build_package_to_memory(package_in_memory, bfcap);
-		// do something with package_in_memory
+		if (package.build_package_to_memory(package_in_memory, bfcap)) {
+			// success
+			// do something with package_in_memory
+		}
+		else {
+			// handle error
+		}
 		free(package_in_memory);
 	}
 
