@@ -303,22 +303,22 @@ void Package_Reader::resolve_entry(void *it, char **name, uint64_t *entry_offset
     }
 
     uint32_t name_len = *(uint32_t *)n;
-    n += 4; 
+    n += sizeof(Package_Entry::name_len); 
     *name = (char *)n; 
 
     n += name_len;
-    n += 4; // identifier
-    n += 4; // user_tag
+    n += sizeof(Package_Entry::identifier); // identifier
+    n += sizeof(Package_Entry::user_tag); // user_tag
 
     if (n < data+data_len) {
         *entry_offset = *(uint64_t *)n;
     }
-    n += 8; // offset_from_start;
+    n += sizeof(Package_Entry::offset_from_start_of_file); // offset_from_start;
 
     if (n < data+data_len) {
         *entry_size = *(uint64_t *)n;
     }
-    n += 8; // data_len;
+    n += sizeof(Package_Entry::data_len); // data_len;
 }
 
 void * Package_Reader::iterate_entries(void *it) {
