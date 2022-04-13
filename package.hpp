@@ -1,9 +1,12 @@
+#pragma once
 #include <stdint.h>
 
 typedef uint32_t EntryID;
 
-uint32_t PACKAGE_HEADER_MAGIC_NUMBER = 'SIMP';
-uint32_t PACKAGE_TOC_MAGIC_NUMBER    = 'TOC!';
+static uint32_t PACKAGE_ENTRY_NO_TAG        = 0;
+static uint32_t PACKAGE_HEADER_MAGIC_NUMBER = 'SIMP';
+static uint32_t PACKAGE_TOC_MAGIC_NUMBER    = 'TOC!';
+
 
 
 struct Package_Entry {
@@ -12,7 +15,7 @@ struct Package_Entry {
     
     EntryID        identifier; // unique identifier for the entry in the package. 
     
-    uint32_t       compression_type;
+    uint32_t       user_tag;
     uint64_t       offset_from_start_of_file;
     
     uint64_t       data_len;
@@ -34,12 +37,19 @@ struct Package_Creator {
     uint64_t entry_count;
     uint64_t entry_cap;
 
-    void add_entry(const char *entry_name, const void *data, uint64_t data_len, uint32_t compression_type, EntryID ID);
+    bool build__internal(void *writer_context);
+    bool (*_writer_function)(void *context, const void *data, uint64_t len);
+
+    void add_entry(const char *entry_name, const void *data, uint64_t data_len, uint32_t user_tags);
     bool build_package_to_file(const char *OutputFile);
     
-    void *build_package_to_memory();
-    void free_builded_package_memory(void *memory);
+    bool     build_package_to_memory(void *bf, uint64_t bf_size);
+    uint64_t calculate_size_needed_for_package();
 };
+
+void init_package_creator(Package_Creator *result);
+void free_package_creator(Package_Creator *pc);
+
 
 struct Package_Reader {
     uint8_t  *data;
@@ -61,7 +71,7 @@ struct Package_Reader {
 bool init_package_reader_from_memory(Package_Reader *reader, void *memory, uint64_t mem_len);
 bool init_package_reader_from_file(Package_Reader *reader, const char *fn);
 void free_package_reader(Package_Reader *reader);
-
+bool flush_reader_to_file(Package_Reader *reader, const char *FP);
 
 
 
@@ -74,6 +84,13 @@ void free_package_reader(Package_Reader *reader);
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+struct Package_Memory_Writer_Context {
+    uint64_t used;
+    uint64_t cap;
+    void *data;
+};
+
 
 struct Memory_Builder {
     void *data;
@@ -110,6 +127,31 @@ static inline void builder_reset(Memory_Builder *builder) {
 
 
 
+static bool fwrite_wrapper(void *context, const void *data, uint64_t data_len) {
+    // @TODO : 64bit not supported..
+    if (data_len > 1024ull * 1024ull * 1024ull * 2)
+        return false;
+    return fwrite(data, data_len, 1, (FILE *)context);
+}
+
+static bool memory_writer_wrapper(void *context, const void *data, uint64_t data_len) {
+    auto ctx = (Package_Memory_Writer_Context *)context;
+    if(data_len+ctx->used > ctx->cap)
+        return false;
+    memcpy((uint8_t *)ctx->data + ctx->used, data, data_len);
+    ctx->used+=data_len;
+    return true;
+}
+
+static bool dummy_writer(void *context, const void *data, uint64_t data_len) {
+    (void)(data);
+    uint64_t *v = (uint64_t *)context;
+    *v += data_len;
+    return true;
+}
+
+
+
 void init_package_creator(Package_Creator *result) {
     memset(result, 0, sizeof(*result));
     result->entry_cap = 32;
@@ -125,7 +167,7 @@ void free_package_creator(Package_Creator *pc) {
     }
 }
 
-void Package_Creator::add_entry(const char *entry_name, const void *data, uint64_t data_len, uint32_t comp_type, EntryID ID) {
+void Package_Creator::add_entry(const char *entry_name, const void *data, uint64_t data_len, uint32_t user_tags) {
 
     if (entry_count == entry_cap) {
         entry_cap *= 2;
@@ -137,20 +179,14 @@ void Package_Creator::add_entry(const char *entry_name, const void *data, uint64
 
     entry->name             = entry_name;
     entry->name_len         = (uint32_t)strlen(entry_name) + 1; // for null termination
-    entry->identifier       = ID;
-    entry->compression_type = comp_type;
+    entry->identifier       = 0;
+    entry->user_tag         = user_tags;
     entry->data             = data;
     entry->data_len         = data_len;
 }
 
-bool Package_Creator::build_package_to_file(const char *fn) {
+bool Package_Creator::build__internal(void *writer_context) {
     
-    FILE *file = fopen(fn, "wb");
-    if (!file) {
-        fprintf(stderr, "Package_Creator error : unable to create file %s", fn);
-        return false;
-    }
-
     Memory_Builder builder;
     init_memory_builder(&builder, 1024 * 8);
 
@@ -166,8 +202,8 @@ bool Package_Creator::build_package_to_file(const char *fn) {
         }
 
         builder_append(&builder, &header, sizeof(header));
-        if (1 != fwrite(builder.data, builder.len, 1, file)) {
-            fprintf(stderr, "Package_Creator error : unable to write header to file (%s)!", fn);
+        if (!_writer_function(writer_context, builder.data, builder.len)) {
+            fprintf(stderr, "Package_Creator error : unable to write header!");
             goto ERROR;
         }
     }
@@ -180,8 +216,8 @@ bool Package_Creator::build_package_to_file(const char *fn) {
             Package_Entry *entry = &entries[i];
             entry->offset_from_start_of_file = offset_from_start_of_file;
             
-            if (1 != fwrite(entry->data, entry->data_len, 1, file)) {
-                fprintf(stderr, "Package_Creator error : unable to write entry data to file, entry name was %.*s", entry->name_len, entry->name);
+            if (!_writer_function(writer_context, entry->data, entry->data_len)) {
+                fprintf(stderr, "Package_Creator error : unable to write entry data. Entry name was %.*s", entry->name_len, entry->name);
                 goto ERROR;
             }
 
@@ -202,34 +238,57 @@ bool Package_Creator::build_package_to_file(const char *fn) {
             builder_append(&builder, &entry->name_len                 , sizeof(entry->name_len));
             builder_append(&builder, entry->name                      , entry->name_len);
             builder_append(&builder, &entry->identifier               , sizeof(entry->identifier));
-            builder_append(&builder, &entry->compression_type         , sizeof(entry->compression_type));
+            builder_append(&builder, &entry->user_tag                 , sizeof(entry->user_tag));
             builder_append(&builder, &entry->offset_from_start_of_file, sizeof(entry->offset_from_start_of_file));
             builder_append(&builder, &entry->data_len                 , sizeof(entry->data_len));
         }   
 
 
-        if (1 != fwrite(builder.data, builder.len, 1, file)) {
-            fprintf(stderr, "Unable to put toc to end of file! %s", fn);
+        if (!_writer_function(writer_context, builder.data, builder.len)) {
+            fprintf(stderr, "Unable to put TOC !");
             goto ERROR;
         }
     }
 
 
     free_memory_builder(&builder);
-    fclose(file);
-
     return true;
 
 
     ERROR:
     if (builder.data != NULL) 
         free_memory_builder(&builder);
-    if (file != NULL)
-        fclose(file);
 
     return false;
 }
 
+
+bool Package_Creator::build_package_to_memory(void *memory, uint64_t cap) {
+    Package_Memory_Writer_Context ctx;
+    ctx.data = memory;
+    ctx.cap  = cap;
+    ctx.used = 0;
+    _writer_function = memory_writer_wrapper;
+    return build__internal((void *)&ctx);
+}
+
+uint64_t Package_Creator::calculate_size_needed_for_package() {
+    uint64_t size_ctx = 0;
+    _writer_function = dummy_writer;
+    build__internal(&size_ctx);
+    return size_ctx;
+}                                                                      
+
+bool Package_Creator::build_package_to_file(const char *fn) {
+    bool res = false;
+    FILE *file = fopen(fn, "wb");
+    if (file!=NULL) {
+        _writer_function = fwrite_wrapper;
+        res = build__internal((void *)file);
+        fclose(file);
+    }
+    return res;
+}
 
 
 
@@ -244,12 +303,12 @@ void Package_Reader::resolve_entry(void *it, char **name, uint64_t *entry_offset
     }
 
     uint32_t name_len = *(uint32_t *)n;
-    n += 4;
+    n += 4; 
     *name = (char *)n; 
 
     n += name_len;
     n += 4; // identifier
-    n += 4; // compression_type
+    n += 4; // user_tag
 
     if (n < data+data_len) {
         *entry_offset = *(uint64_t *)n;
@@ -280,12 +339,12 @@ void * Package_Reader::skip_to_next_entry(void *it) {
     uint8_t *n = (uint8_t *)it;
     uint32_t name_len = *(uint32_t *)it;
 
-    n += 4;        // name len
+    n += sizeof(Package_Entry::name_len);        // name len
     n += name_len; // name
-    n += 4; // identifier
-    n += 4; // compression_type
-    n += 8; // offset_from_start
-    n += 8; // data_len
+    n += sizeof(Package_Entry::identifier); // identifier
+    n += sizeof(Package_Entry::user_tag); // user_tag
+    n += sizeof(Package_Entry::offset_from_start_of_file); // offset_from_start
+    n += sizeof(Package_Entry::data_len); // data_len
 
     if (n >= data+data_len)
         return NULL;
@@ -405,5 +464,28 @@ bool init_package_reader_from_memory(Package_Reader *reader, void *memory, uint6
 }
 
 
+bool flush_reader_to_file(Package_Reader *reader, const char *FP) {
+    bool ret = false;
+    FILE *f = fopen(FP, "wb");
+    if (f) {
+        if (1 == fwrite(reader->data, reader->data_len, 1, f)) {
+            // ok!
+            ret = true;
+        }
+        else {
+            fprintf(stderr, "flush_reader_to_file failed, unable to write to file %s\n", FP); 
+        }
+
+        fclose(f);
+    }
+    else {
+        fprintf(stderr, "flush_reader_to_file failed, unable to create file %s\n", FP);
+    }
+    return ret;
+}
+
+
+
 #endif
+
 
