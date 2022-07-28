@@ -8,7 +8,12 @@ static uint32_t PACKAGE_HEADER_MAGIC_NUMBER = 'SIMP';
 static uint32_t PACKAGE_TOC_MAGIC_NUMBER    = 'TOC!';
 
 
-
+/*
+    FORMAT: 
+    header [very low size, magic number, version and some pointers]
+    body   [1...n]
+    table of contents []
+*/
 struct Package_Entry {
     uint32_t       name_len;
     const char     *name;
@@ -16,7 +21,7 @@ struct Package_Entry {
     EntryID        identifier; // unique identifier for the entry in the package. 
     
     uint32_t       user_tag;
-    uint64_t       offset_from_start_of_file;
+    uint64_t       offset_from_start_of_package;
     
     uint64_t       data_len;
     const void     *data;
@@ -41,10 +46,22 @@ struct Package_Creator {
     bool (*_writer_function)(void *context, const void *data, uint64_t len);
 
     void add_entry(const char *entry_name, const void *data, uint64_t data_len, uint32_t user_tags);
-    bool build_package_to_file(const char *OutputFile);
+    bool build_package_to_file(const char *output_file);
     
     bool     build_package_to_memory(void *bf, uint64_t bf_size);
     uint64_t calculate_size_needed_for_package();
+
+
+    /*
+        STREAMING.
+
+        setup is same /w memory-file. you just add entries over and over.
+    */
+#if 0
+    uint64_t build_package_head(void *memory, uint64_t max_cap);
+    uint64_t build_package_tail(void *memory, uint64_t max_cap);
+#endif
+
 };
 
 void init_package_creator(Package_Creator *result);
@@ -65,7 +82,8 @@ struct Package_Reader {
     void resolve_entry(void *it, char **name, uint64_t *entry_offset, uint64_t *entry_size);
     void *iterate_entries(void *it);
     void *skip_to_next_entry(void *entry);
-
+    
+    
 };
 
 bool init_package_reader_from_memory(Package_Reader *reader, void *memory, uint64_t mem_len);
@@ -204,24 +222,24 @@ bool Package_Creator::build__internal(void *writer_context) {
         builder_append(&builder, &header, sizeof(header));
         if (!_writer_function(writer_context, builder.data, builder.len)) {
             fprintf(stderr, "Package_Creator error : unable to write header!");
-            goto ERROR;
+            goto PACKAGE_BAIL_OUT_ERROR;
         }
     }
 
 
     // write entry datas!
     {
-        uint64_t offset_from_start_of_file = builder.len;
+        uint64_t offset_from_start_of_package = builder.len;
         for(int i=0;i<entry_count;++i) {
             Package_Entry *entry = &entries[i];
-            entry->offset_from_start_of_file = offset_from_start_of_file;
+            entry->offset_from_start_of_package = offset_from_start_of_package;
             
             if (!_writer_function(writer_context, entry->data, entry->data_len)) {
                 fprintf(stderr, "Package_Creator error : unable to write entry data. Entry name was %.*s", entry->name_len, entry->name);
-                goto ERROR;
+                goto PACKAGE_BAIL_OUT_ERROR;
             }
 
-            offset_from_start_of_file += entry->data_len;
+            offset_from_start_of_package += entry->data_len;
         }
     }
 
@@ -239,14 +257,14 @@ bool Package_Creator::build__internal(void *writer_context) {
             builder_append(&builder, entry->name                      , entry->name_len);
             builder_append(&builder, &entry->identifier               , sizeof(entry->identifier));
             builder_append(&builder, &entry->user_tag                 , sizeof(entry->user_tag));
-            builder_append(&builder, &entry->offset_from_start_of_file, sizeof(entry->offset_from_start_of_file));
+            builder_append(&builder, &entry->offset_from_start_of_package, sizeof(entry->offset_from_start_of_package));
             builder_append(&builder, &entry->data_len                 , sizeof(entry->data_len));
         }   
 
 
         if (!_writer_function(writer_context, builder.data, builder.len)) {
             fprintf(stderr, "Unable to put TOC !");
-            goto ERROR;
+            goto PACKAGE_BAIL_OUT_ERROR;
         }
     }
 
@@ -255,7 +273,7 @@ bool Package_Creator::build__internal(void *writer_context) {
     return true;
 
 
-    ERROR:
+PACKAGE_BAIL_OUT_ERROR:
     if (builder.data != NULL) 
         free_memory_builder(&builder);
 
@@ -313,7 +331,7 @@ void Package_Reader::resolve_entry(void *it, char **name, uint64_t *entry_offset
     if (n < data+data_len) {
         *entry_offset = *(uint64_t *)n;
     }
-    n += sizeof(Package_Entry::offset_from_start_of_file); // offset_from_start;
+    n += sizeof(Package_Entry::offset_from_start_of_package); // offset_from_start;
 
     if (n < data+data_len) {
         *entry_size = *(uint64_t *)n;
@@ -343,7 +361,7 @@ void * Package_Reader::skip_to_next_entry(void *it) {
     n += name_len; // name
     n += sizeof(Package_Entry::identifier); // identifier
     n += sizeof(Package_Entry::user_tag); // user_tag
-    n += sizeof(Package_Entry::offset_from_start_of_file); // offset_from_start
+    n += sizeof(Package_Entry::offset_from_start_of_package); // offset_from_start
     n += sizeof(Package_Entry::data_len); // data_len
 
     if (n >= data+data_len)
@@ -381,6 +399,7 @@ void free_package_reader(Package_Reader *reader) {
 
 bool init_package_reader_from_file(Package_Reader *reader, const char *fn) {
     
+    memset(reader,0,sizeof(*reader));
     bool result = false;
 
     FILE *file = fopen(fn, "rb");
@@ -426,11 +445,10 @@ bool init_package_reader_from_file(Package_Reader *reader, const char *fn) {
 
 bool init_package_reader_from_memory(Package_Reader *reader, void *memory, uint64_t mem_len) {
 
+    memset(reader,0,sizeof(*reader));
 
     if (mem_len <= sizeof(Package_Header))
         return false;
-
-    memset(reader,0,sizeof(*reader));
     
     bool result = false;
     reader->data     = (uint8_t *)memory;
@@ -442,7 +460,7 @@ bool init_package_reader_from_memory(Package_Reader *reader, void *memory, uint6
         if (mem_len >= reader->header.toc_offset) {
             reader->toc = reader->data + reader->header.toc_offset;
             if (*(uint32_t *)reader->toc == PACKAGE_TOC_MAGIC_NUMBER) {
-                reader->toc += 4;
+                reader->toc += 4; // SKIP TOC MAGIC
                 // @Incomplete : 
                 // @TODO       : do full validation of table of contents.
                 result = true;
